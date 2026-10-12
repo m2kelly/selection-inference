@@ -248,6 +248,8 @@ def transition_matrix_scale(matrix_original, scale):
 
     else: return scale_f(matrix)
 
+
+
 def get_sub_matrix_from_scaled_mut_matrix_database(mut_matrix_device, population_size, selection=0, scale=None):
     #the mut matrix is already scaled, the scale parameter is used for the database index
     if scale:
@@ -310,44 +312,46 @@ def get_sub_matrix_from_mut_matrix_host(mu_matrix_host, population_size, selecti
     return sub_matrix_device
 
 def get_mut_matrix_from_sub_matrix(sub_matrix, population_size, selection=0):
+    '''
+    function to input sub matrix and N and calculate the best fitting mut matrix
+    using the four-allele mutation model for each trinucleotide flank context.
+    '''
     sub_index = sub_matrix.index; sub_columns = sub_matrix.columns
-    sub_matrix = pd.DataFrame(cupy.array(sub_matrix).get())
-    mut_matrix = pd.DataFrame(np.zeros(sub_matrix.shape))
+    sub_matrix = pd.DataFrame(
+        cupy.array(sub_matrix).get(), index=sub_index, columns=sub_columns
+    )
+    mut_matrix = pd.DataFrame(0.0, index=sub_index, columns=sub_columns)
 
-    mutations_dics, mutations_dics_list = es.df_to_dics(sub_matrix)
+    for left in es.BASES:
+        for right in es.BASES:
+            sub_rates = pd.DataFrame(0.0, index=es.BASES, columns=es.BASES)
+            for ref in es.BASES:
+                source_context = left + ref + right
+                for alt in es.BASES:
+                    if alt == ref:
+                        continue
+                    target_context = left + alt + right
+                    sub_rates.loc[ref, alt] = sub_matrix.loc[
+                        source_context, target_context
+                    ]
 
-    def f (sub_dict):
-        import warnings
-        warnings.filterwarnings("ignore")
-        sub = float(list(sub_dict.values())[0])
-        key = list(sub_dict.keys())[0]
-        if key[0] == key[1]: return {key:0}
-        if sub == 0: return {key:0}
-        if np.isnan(sub): return {key:0}
+            point = GPA(0, 0, population_size, selection_coeff=selection)
+            mu_rates = predictor.get_mu(
+                point, sub_rates.to_dict(orient='index'), return_matrix=True
+            )
+            for ref in es.BASES:
+                source_context = left + ref + right
+                for alt in es.BASES:
+                    if alt == ref:
+                        continue
+                    target_context = left + alt + right
+                    mut_matrix.loc[source_context, target_context] = mu_rates[ref][alt]
 
-        #mu = mutations_dics[(key[0], key[1])]
-        backwards_mu = mutations_dics[(key[1], key[0])]
+    for context in es.CONTEXTS:
+        mut_matrix.loc[context, context] = 1 - mut_matrix.loc[context].sum()
+    return mut_matrix
 
-        point = GPA(0, backwards_mu, population_size, selection_coeff=selection,  mean_sub_rate=sub)
-
-        mu = predictor.get_mu(point)
-
-        if mu in [np.inf, -np.inf, np.nan]: mu = 0
-        return {key:mu}
-
-    _, sub_corrected_by_selection = es.df_to_dics(mut_matrix)
-    number_of_cores = multiprocessing.cpu_count()
-    number_of_cores = 1
-    batch_size = int((64*64)/number_of_cores)
-    analyzed_list = Parallel(n_jobs=-1, verbose=0, batch_size=batch_size)(delayed(f)(s) for s in mutations_dics_list)
-    mut_matrix = es.fill_by_dics(mut_matrix, analyzed_list)
-    for i in range(len(mut_matrix)): #refill the diagonal
-            mut_matrix[i][i] = 1 - mut_matrix[i].sum()
-    mut_matrix = cupy.array(mut_matrix)
-    mut_df = pd.DataFrame(mut_matrix.get(), index=sub_index, columns=sub_columns)
-    return mut_df
-
-def get_transition_matrix_for_observed_mutations(exp_muts_no, occurences,prob, population_size,  obs_ratio=1, selection=0):
+def get_transition_matrix_for_observed_mutations(exp_muts_no, occurences,prob=False, population_size=100000,  obs_ratio=1, selection=0):
     '''
     occurences is trinucs counts per gene from cbase?
     PROBELM here considering only expected non syn muts-so should only accept non syn? 
@@ -370,20 +374,27 @@ def get_transition_matrix_for_observed_mutations(exp_muts_no, occurences,prob, p
         error = lambda n: abs(n-exp_muts_no)
         #error = lambda n: abs(n-exp_muts_no)/exp_muts_no
         scaled_muts_matrix = transition_matrix_scale(general_mut_matrix, ratio)
-        guessed_sub_matrix = get_sub_matrix_from_scaled_mut_matrix_database(scaled_muts_matrix, population_size, selection, scale=ratio)
+        #pd.DataFrame(data=scaled_muts_matrix.get()).to_csv(f'test/mut_matrix_s_0_best_ratio_{ratio}')
+        guessed_sub_matrix=get_sub_matrix_from_mut_matrix_device(scaled_muts_matrix, population_size, selection)
+        #guessed_sub_matrix = get_sub_matrix_from_scaled_mut_matrix_database(scaled_muts_matrix, population_size, selection, scale=ratio)
+        #pd.DataFrame(data=guessed_sub_matrix.get()).to_csv(f'test/sub_matrix_s_0_{ratio}')
         #calcs expected number of mutations given starting trinuc freqs and sub matrix Q and gene time (pie^Qt)
         #occuences is series with index trinucs
-        pd.DataFrame(guessed_sub_matrix.get(),index=range(64),columns=range(64)).to_csv('test_subs.csv')
+        #print(prob)
+        if isinstance(prob, pd.DataFrame):
+            number_of_mutations = get_number_of_mutations_syn(occurences, guessed_sub_matrix,prob)
+      
+        elif prob==False:
+            number_of_mutations = get_number_of_mutations(occurences, guessed_sub_matrix)
+        print(f'rescale expected {number_of_mutations}, cbase exp {exp_muts_no},ratio= {ratio}')
         
-        number_of_mutations = get_number_of_mutations_syn(occurences, guessed_sub_matrix,prob)
-        print(f'rescale expected {number_of_mutations}, cbase exp {exp_muts_no}')
         return float(error(number_of_mutations))
 
     one_ratio_sub_matrix = get_sub_matrix_from_scaled_mut_matrix_database(general_mut_matrix, population_size, selection, scale=1.0)
     one_ratio_muts = get_number_of_mutations_syn(occurences, one_ratio_sub_matrix,prob)
     print(f'one ratio muts {one_ratio_muts}')
     if one_ratio_muts > exp_muts_no:
-        bounds = [1, 0.05]
+        bounds = [0.1, 1]
     else:
         bounds = [1, 5]
     

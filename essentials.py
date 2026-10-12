@@ -73,6 +73,7 @@ def df_to_dics(df):
     index = dics['index']
     columns = dics['columns']
     data = dics['data']
+    #represents df.loc[i][j] entry (but this was transposed so index=input output=target?)
     dics = [{(i, j): data[i][j]} for i in index for j in columns]
     one_dic = {(i, j): data[i][j] for i in index for j in columns}
     return one_dic, dics

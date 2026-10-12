@@ -60,7 +60,10 @@ def export_analyzed_genes(analyzed_genes, output_file='analyzed_genes.csv'):
 
     print(f'Data has been successfully exported to {output_file}')
 
-def compute_p_values(p, genes, aux, occs_df_dict, syn_target_df_dict,so=None):
+def compute_p_values(
+    p, genes, aux, occs_df_dict, syn_target_df_dict, so=None,
+    nonsyn_sites_by_gene=None,
+):
     
     
     
@@ -295,7 +298,18 @@ def compute_p_values(p, genes, aux, occs_df_dict, syn_target_df_dict,so=None):
                             sys.stderr.write("p_k^neg on gene %s: %f --> 1.\n" %(gene["gene"], k_pneg))
                         k_pneg = 1.
             if not simC:
-                gene = Gene(gene, large_flag=0, occs=occs_df_dict[gene["gene"]], syn_target=syn_target_df_dict[gene["gene"]],pofx_given_s=pofx_given_s)
+                gene = Gene(
+                    gene,
+                    large_flag=0,
+                    occs=occs_df_dict[gene["gene"]],
+                    syn_target=syn_target_df_dict[gene["gene"]],
+                    pofx_given_s=pofx_given_s,
+                    nonsyn_sites=(
+                        nonsyn_sites_by_gene.get(gene["gene"])
+                        if nonsyn_sites_by_gene is not None
+                        else None
+                    ),
+                )
                 if so:
                     analyzed_gene = so.run_analysis(gene)
                 #genes_dn_by_dn.append(get_dn_by_dn(gene["gene"], mobs, kobs, pofx_given_s, sobs, L, ratm, ratk, large_flag,
@@ -435,7 +449,10 @@ run_no		= 50					#	No. of simulation replicates used for computing FDR
 #***********************************************************************************************
 #
 #	Collect parameter estimates from all fitted models in working directory.
-def compute_q_values(directory, outname, output_dir, occs_dfs,syn_target_dfs, population_size=None):
+def compute_q_values(
+    directory, outname, output_dir, occs_dfs, syn_target_dfs,
+    population_size=None, nonsyn_sites_by_gene=None,
+):
     if population_size: so = SelectionOperations(population_size=population_size)
 
     #shitty way to get the matrix
@@ -501,7 +518,15 @@ def compute_q_values(directory, outname, output_dir, occs_dfs,syn_target_dfs, po
     #mks_type = sorted(mks_type, key=lambda arg: arg["obs"][0]/arg["exp"][0])
 
     sys.stderr.write("Computing real p-values.\n")
-    genesdn_dn, pvals_obs, analyzed_genes  = compute_p_values(params, mks_type, [mod_C, 0, 1], occs_dfs, syn_target_dfs,so)
+    genesdn_dn, pvals_obs, analyzed_genes = compute_p_values(
+        params,
+        mks_type,
+        [mod_C, 0, 1],
+        occs_dfs,
+        syn_target_dfs,
+        so,
+        nonsyn_sites_by_gene,
+    )
 
     export_analyzed_genes(analyzed_genes)
 

@@ -7,6 +7,7 @@ import essentials as es
 import cuda_operations as co
 import numpy as np
 from joblib import Parallel, delayed
+from scipy.optimize import minimize_scalar
 
 from predictor import Predictor
 from graphpoint import GraphPointAbstract as GPA
@@ -57,11 +58,20 @@ class SelectionOperations:
         
         selection = self.get_selection(gene, expected_n)
         print(f'{gene.gene_name}: selection = {selection}, expected = {expected_n}, obs = {gene.nobs}')
+        #for speeding only run expected, not high,low intervals
+        '''
         lowest_n, highest_n = self.get_percentiles(gene, gene.ratn)
         lowest_selection = self.get_selection(gene, highest_n)
         print(f'{gene.gene_name}: lowest = {lowest_selection}, expected = {highest_n}, obs = {gene.nobs}')
         highest_selection = self.get_selection(gene, lowest_n)
         print(f'{gene.gene_name}: highest = {highest_selection}, expected = {lowest_n}, obs = {gene.nobs}')
+        '''
+        #only if not running lower/upper limits
+        highest_selection= selection
+        lowest_selection=selection
+        lowest_n=expected_n
+        highest_n=expected_n
+
 
         gene.expected_selection = selection
         gene.max_possible_highest_selection = highest_selection
@@ -125,6 +135,9 @@ class SelectionOperations:
     def get_selection(self, gene, nexp):
 
         if gene.nobs == nexp: return 0
+        if gene.nonsyn_sites is not None:
+            return self.get_selection_four_allele(gene, nexp)
+
         #neutral run, s=0 to rescale mut matrix
         #minimises x  |sub=f(x*mu, N, s=0)-nexp| 
         occurences=gene.occs
@@ -132,18 +145,27 @@ class SelectionOperations:
         syn_prob= es.matri64x4_to_64x64(gene.syn_target)
         nonsyn_prob=es.matri64x4_to_64x64(nonsyn_target)
         
+
         #trying scling with nexp only
         #mutations_matrix, best_ratio = self.get_transition_matrix(gene, nexp+gene.sobs) #consider all subs-do not restrict to syn or non syn
-        mutations_matrix, best_ratio = self.get_transition_matrix(gene, gene.sobs,syn_prob)
-        mutations_matrix_host = pd.DataFrame(mutations_matrix.get())
+        #mutations_matrix, best_ratio = self.get_transition_matrix(gene, gene.sobs,syn_prob)
+        mutations_matrix, best_ratio = self.get_transition_matrix(gene,nexp,nonsyn_prob)
+        #mutations_matrix_host = pd.DataFrame(mutations_matrix.get())
         
         
         "TO DO check wether to divide along axis or index"
+        #index=target, columns=ref
+        #host not given same output as database using inside get transition matrix
+        #sub_matrix_no_s=co.get_sub_matrix_from_mut_matrix_host(mutations_matrix_host, population_size=self.population_size,selection=0)
         
-        sub_matrix_no_s=co.get_sub_matrix_from_mut_matrix_host(mutations_matrix_host, population_size=self.population_size,
-                                                            selection=0)
-        expected_s =co.get_number_of_mutations_syn(occurences, sub_matrix_no_s,syn_prob)
-        print(f'expected s {expected_s},real s {gene.sobs}')
+        #pd.DataFrame(data=best_mu_matrix.get()).to_csv(f'test/mu_matrix_s_0')
+        #sub_matrix_no_s=co.get_sub_matrix_from_mut_matrix_device(mutations_matrix, self.population_size, selection=0)
+        #sub_matrix_no_s=co.get_sub_matrix_from_scaled_mut_matrix_database(mutations_matrix, population_size=self.population_size,selection=0,scale=best_ratio)
+        #pd.DataFrame(data=sub_matrix_no_s.get()).to_csv(f'test/sub_matrix_s_0')
+        #check and cols =ref trinucs, index =alt trinucs
+        # not correctly rescaling based on best ratio 
+        #expected_s =co.get_number_of_mutations_syn(occurences, sub_matrix_no_s,syn_prob)
+        #print(f'expected s {expected_s},real s {gene.sobs}')
         
         tolerance = 0.1
         obs_subs = gene.nobs 
@@ -153,9 +175,12 @@ class SelectionOperations:
         def error_function(selection):
             print(selection)
             try:
-
-                sub_matrix = co.get_sub_matrix_from_mut_matrix_host(mutations_matrix_host, population_size=self.population_size,
-                                                            selection=selection)
+                
+                #problem with sub matrix host 
+                sub_matrix=co.get_sub_matrix_from_mut_matrix_device(mutations_matrix, self.population_size, selection=selection)
+                #sub_matrix=co.get_sub_matrix_from_scaled_mut_matrix_database(mutations_matrix, population_size=self.population_size,selection=selection,scale=best_ratio)
+                #sub_matrix = co.get_sub_matrix_from_mut_matrix_host(mutations_matrix_host, population_size=self.population_size,selection=selection)
+                #pd.DataFrame(data=sub_matrix.get()).to_csv(f'test/sub_matrix_s_{selection}')
                 #if have nan entries then conitnue
                 #check if sub_matrix is an identity matrix
                 #if sub_matrix is None or not cupy.isfinite(sub_matrix).all():
@@ -176,158 +201,133 @@ class SelectionOperations:
 
             except OverflowError as e:
                 return np.inf
-
-        selection = self.predictor.minimize_by_search_selection(error_function, self.selection_range,neg_direction)
-
-        return selection
-    
-
-    def get_selection_test_n_s(self, gene, nexp):
-
-        if gene.nobs == nexp: return 0
-        #neutral run, s=0 to rescale mut matrix
-        #minimises x  |sub=f(x*mu, N, s=0)-nexp| 
-
-        #maria to do-edit so outputs sub matrix without selection-for syn target
-        print('getting rescaled mut matrix')
-        mutations_matrix, best_ratio = self.get_transition_matrix(gene, nexp+gene.sobs) #consider all subs-do not restrict to syn or non syn
-        mutations_matrix_host = pd.DataFrame(mutations_matrix.get())
-        
-        occurences=gene.occs
-        nonsyn_target=1-gene.syn_target
-        for i in range(64):
-            nonsyn_target.loc[i,i]=0.0
-        syn_prob= es.matri64x4_to_64x64(gene.syn_target)
-        nonsyn_prob=es.matri64x4_to_64x64(nonsyn_target)
-        
-        "TO DO check wether to divide along axis or index"
-        
-        sub_matrix_no_s=co.get_sub_matrix_from_mut_matrix_host(mutations_matrix_host, population_size=self.population_size,
-                                                            selection=0)
-        expected_s =co.get_number_of_mutations_syn(occurences, sub_matrix_no_s,syn_prob)
-        print(f'expected s {expected_s}')
-        
-        tolerance = 0.1
-        obs_subs = gene.nobs +gene.sobs
-        neg_direction = True if gene.nobs < nexp else False
         print(neg_direction)
-        def error_function(selection):
-            print(selection)
-            try:
-
-                sub_matrix = co.get_sub_matrix_from_mut_matrix_host(mutations_matrix_host, population_size=self.population_size,
-                                                            selection=selection)
-                print(sub_matrix) #if have nan entries then conitnue
-                #check if sub_matrix is an identity matrix
-                #if sub_matrix is None or not cupy.isfinite(sub_matrix).all():
-                    #return np.inf
-            
-                if not neg_direction and (cupy.all(cupy.eye(64) == sub_matrix)):
-                    return np.inf
-                #TO DO EDIT THESE FUNCTIONS
-                print('calculating expected_n')
-                expected_n = co.get_number_of_mutations_syn(occurences, sub_matrix,nonsyn_prob)
-                if np.isnan(expected_n):
-                    return np.inf
-                print(f'expected n {expected_n}')
-                print('calculating expected_s')
-                
-                expected_subs=expected_n+expected_s
-                return -1 if (expected_subs <= 0.01 and obs_subs== 0) else abs(expected_subs-obs_subs)
-
-            except OverflowError as e:
-                return np.inf
-
         selection = self.predictor.minimize_by_search_selection(error_function, self.selection_range,neg_direction)
 
         return selection
+
+    def _get_four_allele_mutation_matrix(self, left, right, scale):
+        if not hasattr(self, 'general_mut_matrix'):
+            self.general_mut_matrix = pd.read_csv(
+                'files/best_in_df_mutations_4_allele.csv',
+                index_col=0,
+                sep='\t',
+            )
+
+        matrix = {base: {alt: 0.0 for alt in BASES} for base in BASES}
+        for ref in BASES:
+            source_context = left + ref + right
+            for alt in BASES:
+                if alt == ref:
+                    continue
+                target_context = left + alt + right
+                matrix[ref][alt] = (
+                    float(self.general_mut_matrix.loc[source_context, target_context])
+                    * scale
+                )
+        return matrix
+
+    def _expected_four_allele_nonsyn(self, gene, scale, selection):
+        if self.population_size is None:
+            raise ValueError('population_size is required for four-allele inference')
+
+        point = GPA(0, 0, self.population_size)
+        matrix_cache = {}
+        rate_cache = {}
+        expected = 0.0
+        for site in gene.nonsyn_sites:
+            trinucleotide = site['trinucleotide']
+            ref = site['reference_base']
+            nonsyn_alts = tuple(site['nonsyn_alt_bases'])
+            left, right = trinucleotide[0], trinucleotide[2]
+            context_key = (left, right)
+            if context_key not in matrix_cache:
+                matrix_cache[context_key] = self._get_four_allele_mutation_matrix(
+                    left, right, scale
+                )
+
+            rate_key = (context_key, ref, nonsyn_alts, selection)
+            if rate_key not in rate_cache:
+                fitness = {base: 1.0 for base in BASES}
+                for alt in nonsyn_alts:
+                    fitness[alt] = 1.0 + selection
+                rate_cache[rate_key] = sum(
+                    self.predictor.get_sub_rate_diffusion_4_allele_renewal_selection(
+                        point,
+                        matrix_cache[context_key],
+                        fitness_matrix=fitness,
+                        all_rates=False,
+                        a=ref,
+                        b=alt,
+                    )
+                    for alt in nonsyn_alts
+                )
+
+            expected += (
+                float(site['count'])
+                * rate_cache[rate_key]
+                * self.generations
+            )
+        return expected
+
+    def get_selection_four_allele(self, gene, nexp):
+        if not gene.nonsyn_sites:
+            if gene.nobs == 0:
+                return 0.0
+            raise ValueError(
+                f'No possible nonsynonymous sites were parsed for {gene.gene_name}'
+            )
+        if nexp <= 0:
+            raise ValueError(
+                f'Cannot calibrate a positive mutation rate from expected_n={nexp} '
+                f'for {gene.gene_name}'
+            )
+
+        def neutral_error(log_scale):
+            expected = self._expected_four_allele_nonsyn(
+                gene, 10 ** log_scale, 0.0
+            )
+            return abs(expected - nexp)
+
+        scale_solution = minimize_scalar(
+            neutral_error,
+            bounds=(np.log10(0.1), np.log10(5.0)),
+            method='bounded',
+        )
+        if not scale_solution.success or not np.isfinite(scale_solution.fun):
+            raise RuntimeError(
+                f'Could not rescale the four-allele mutation rates for {gene.gene_name}'
+            )
+        scale = 10 ** scale_solution.x
+        lower, upper = self.selection_range
+        if gene.nobs < nexp:
+            lower, upper = -upper, -lower
+
+        def selection_error(selection):
+            expected = self._expected_four_allele_nonsyn(
+                gene, scale, selection
+            )
+            print(f'{gene.gene_name}: selection = {selection}, expected = {expected}, obs = {gene.nobs}')
+            return abs(expected - gene.nobs)
+
+        selection_solution = minimize_scalar(
+            selection_error,
+            bounds=(lower, upper),
+            method='bounded',
+        )
+        if not selection_solution.success or not np.isfinite(selection_solution.fun):
+            raise RuntimeError(
+                f'Could not infer four-allele selection for {gene.gene_name}'
+            )
+        return float(selection_solution.x)
     
 
-    def get_selection_copy(self, gene, nexp):
-
-        if gene.nobs == nexp: return 0
-        #neutral run, s=0 to rescale mut matrix
-        #minimises x  |sub=f(x*mu, N, s=0)-nexp| 
-
-        #maria to do-edit so outputs sub matrix without selection-for syn target
-        print('getting rescaled mut matrix')
-        print(f' s obs is {gene.sobs}')
-        mutations_matrix, best_ratio = self.get_transition_matrix(gene, gene.sobs+nexp) #consider all subs-do not restrict to syn or non syn
-        mutations_matrix_host = pd.DataFrame(mutations_matrix.get())
-        print(mutations_matrix_host)
-        sub_matrix_no_s=co.get_sub_matrix_from_mut_matrix_host(mutations_matrix_host, population_size=self.population_size,
-                                                            selection=0)
-        
-        occurences=gene.occs
-        nonsyn_target=1-gene.syn_target
-        syn_prob= es.matri64x4_to_64x64(gene.syn_target)
-        nonsyn_prob=es.matri64x4_to_64x64(nonsyn_target)
-        
-        "TO DO check wether to divide along axis or index"
-        
-        print(f'syn prob {syn_prob}')
-        print(f'non syn prob {nonsyn_prob}')
-        
-        tolerance = 0.1
-        neg_direction = True if gene.nobs < nexp else False
-        def error_function(selection):
-            try:
-
-                sub_matrix = co.get_sub_matrix_from_mut_matrix_host(mutations_matrix_host, population_size=self.population_size,
-                                                            selection=selection)
-                print(sub_matrix) #if have nan entries then conitnue
-                #check if sub_matrix is an identity matrix
-                if not neg_direction and (cupy.all(cupy.eye(64) == sub_matrix)):
-                    return np.inf
-                if sub_matrix is None or not cupy.isfinite(sub_matrix).all():
-                    return np.inf
-                #TO DO EDIT THESE FUNCTIONS
-                print('calculating expected_n')
-                expected_n = co.get_number_of_mutations_syn(occurences, sub_matrix,nonsyn_prob)
-                print(f'expected n {expected_n}')
-                print('calculating expected_s')
-                expected_s =co.get_number_of_mutations_syn(occurences, sub_matrix_no_s,syn_prob)
-                print(f'expected n {expected_n}')
-                return -1 if (expected_n <= 0.01 and (gene.nobs +gene.sobs)== 0) else expected_n+expected_s
-
-            except OverflowError as e:
-                return np.inf
 
 
-
-        try:
-
-            selection = self.predictor.binary_search(error_function, self.selection_range, gene.nobs+gene.sobs,
-                                                    negative=neg_direction, max_depth=30, tol=tolerance)
-        except Exception as e:
-            print(e)
-            if e.args[0] == 'did not converge':
-                def error_grid_function(selection):
-                    n = error_function(selection)
-                    #0.6 is a hack to deal with the case where the expected number of mutations is 0
-                    return 0.6 if (n <= tolerance and gene.nobs == 0) else abs(n-gene.nobs-gene.sobs)
-
-                selection = self.predictor.minimize_by_search(error_grid_function, self.selection_range,
-                                              negative=neg_direction, max_depth=30, breadth=5,
-                                              nearest_value_tie_breaker=0, tol=tolerance, parallel=False)
-
-        return selection
-        '''
-        else:
-            raise Exception('not yet implemented')
-
-            if get_subs_based_on_selection(nobs, gene_df, occs_df, syn_ratio, missense_ratio, max(selection_range)) > nexp:
-                return 1
-            else:
-                def error_function(selection):
-                    return get_subs_based_on_selection(nobs, gene_df, occs_df, syn_ratio, missense_ratio, selection) - nobs
-                selection = predictor.minimize_by_search(error_function, selection_range, negative=False)
-                return selection'''
-
-    def get_transition_matrix(self, gene, nexp, prob,ratio=None):
-        if ratio is None: ratio = gene.syn_ratio
+    def get_transition_matrix(self, gene, nexp, prob=False,ratio=None):
+        if ratio is None: ratio = 1
         #syn_prob= es.matri64x4_to_64x64(gene.syn_target)
-        mu_matrix, best_ratio = co.get_transition_matrix_for_observed_mutations(nexp, gene.occs, prob, population_size=self.population_size, selection=0)
+        mu_matrix, best_ratio = co.get_transition_matrix_for_observed_mutations(nexp, gene.occs,prob, population_size=self.population_size, selection=0)
         return mu_matrix, best_ratio
 
     def get_mutations_matrix(self, transition_matrix):
@@ -367,7 +367,7 @@ class SelectionOperations:
 
 class Gene:
     ''' to be changed to a modified gene class'''
-    def __init__(self, pickled_gene, large_flag=0, matrix=None, occs=None, syn_target=None,pofx_given_s=None):
+    def __init__(self, pickled_gene, large_flag=0, matrix=None, occs=None, syn_target=None,pofx_given_s=None,nonsyn_sites=None):
         self.gene_name = pickled_gene['gene']
         self.sobs = int(pickled_gene["obs"][2])
         self.mobs = int(pickled_gene["obs"][0])
@@ -389,6 +389,7 @@ class Gene:
         self.occs = occs
         self.syn_target = syn_target
         self.pofx_given_s = pofx_given_s
+        self.nonsyn_sites = nonsyn_sites
 
         self.expected_selection = None
         self.max_possible_highest_selection = None

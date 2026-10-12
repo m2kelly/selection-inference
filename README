@@ -1,0 +1,6 @@
+run correct_dndn.py
+in files place rates df, then convert to muts df
+
+output is given in analysed genes:
+[gene.gene_name, str(gene.expected_selection), str(gene.max_possible_highest_selection), str(gene.min_possible_highest_selection),
+                      str(gene.expected_n), str(gene.lowest_n), str(gene.highest_n), str(gene.nobs)] 

@@ -1,0 +1,7 @@
+episode	region	group
+hg38	first_coding_exon	[first_coding_exon, first_of_twos, last_coding_exon, second_of_twos, internal_exon, one_exon]
+hg38	internal_exon	[first_coding_exon, first_of_twos, last_coding_exon, second_of_twos, internal_exon, one_exon]
+hg38	last_coding_exon	[first_coding_exon, first_of_twos, last_coding_exon, second_of_twos, internal_exon, one_exon]
+hg38	one_exon	[first_coding_exon, first_of_twos, last_coding_exon, second_of_twos, internal_exon, one_exon]
+hg38	first_of_twos	[first_coding_exon, first_of_twos, last_coding_exon, second_of_twos, internal_exon, one_exon]
+hg38	second_of_twos	[first_coding_exon, first_of_twos, last_coding_exon, second_of_twos, internal_exon, one_exon]

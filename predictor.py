@@ -211,7 +211,7 @@ class Predictor():
         solve for mu_a_b simultaneously for a,b in [A,C,G,T]
         calculating from 4 allele diffusion sub rate
         mu matrix is a dict of dicts with keys A,C,G,T and values the mutation rates
-
+        using non neutral get sub rate-change to use neutral when no s
         """
         def matrix_to_vector(matrix,index_list=False):
             """
@@ -304,6 +304,8 @@ class Predictor():
         if a is None or b is None:
             raise ValueError("a and b are required unless return_matrix=True")
         return mu_solution[index_list.index((a, b))]
+
+
 
     def get_mu_least_squares(self, point,sub_matrix,a,b,return_matrix=False):
         """

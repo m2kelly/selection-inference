@@ -1,0 +1,6 @@
+git reset --soft origin/main
+printf '%s\n' '/Output/cactus/Anc4->hg38/genes/genes.pkl' >> .gitignore
+git rm --cached -- 'Output/cactus/Anc4->hg38/genes/genes.pkl'
+git add .gitignore
+git status --short
+git diff --cached --stat

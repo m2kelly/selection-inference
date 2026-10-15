@@ -219,18 +219,21 @@ def write_summary(summary: pd.DataFrame, path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("genes_pickle", type=Path, help="CBaSE-is genes.pkl")
+    parser.add_argument("--genes_pickle", type=Path,
+                        default=Path("Output/cactus/Anc4->hg38/genes/genes.pkl"), help="CBaSE-is genes.pkl")
+    
     parser.add_argument(
         "--codon-table", type=Path,
         default=Path(__file__).parent / "Auxiliary" / "codon_table.json",
     )
     parser.add_argument(
-        "--summary", type=Path, default=Path("four_allele_site_summary.tsv.gz"),
+        "--summary", type=Path, default=Path("files/four_allele_site_summary.tsv.gz"),
         help="per-gene summary TSV (gzip when the name ends in .gz)",
     )
     parser.add_argument(
         "--sites", type=Path,
         help="optional detailed site TSV (gzip when the name ends in .gz)",
+        #default files/parsed_site_summary.tsv.gz
     )
     parser.add_argument(
         "--gene", action="append", dest="genes",

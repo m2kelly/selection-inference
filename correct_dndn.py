@@ -2,6 +2,8 @@
 #filter warnings
 import warnings
 
+import argparse
+
 import pandas as pd
 warnings.filterwarnings("ignore")
 import pickle
@@ -25,12 +27,13 @@ def get_sig_genes(qvals_file):
     #qvals_df_sig = qvals_df_sig.sample(100)
     return qvals_df_sig.index.tolist()
 
-def calculate_general_muts_matrix_old(pop_size):
-    calculate_general_muts_matrix(pop_size)
 
-def calculate_general_muts_matrix(pop_size):
+
+def calculate_general_muts_matrix(pop_size, force=False):
     mutation_matrix_path = Path('files/best_in_df_mutations_4_allele.csv')
     try:
+        if force:
+            raise FileNotFoundError
         muts_matrix = pd.read_csv(mutation_matrix_path, index_col=0, header=0, sep='\t')
     except FileNotFoundError:
         from cuda_operations import get_mut_matrix_from_sub_matrix
@@ -40,8 +43,44 @@ def calculate_general_muts_matrix(pop_size):
 
     muts_matrix.to_csv(mutation_matrix_path, sep='\t')
 
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--correct-rates-for-recurrence', action='store_true',
+        help=('infer files/best_in_df.csv from files/rates using Q**generations '
+              'before running the existing pipeline'),
+    )
+    parser.add_argument('--rates', default='files/rates')
+    parser.add_argument('--trinucs', default='files/trinucs')
+    parser.add_argument('--generations', type=int, default=160000)
+    return parser.parse_args()
+
 if __name__ == '__main__':
 
+    args = parse_args()
+    if args.correct_rates_for_recurrence:
+        from cuda_operations import get_transition_cpmatrix_from_rates
+
+        rates = pd.read_csv(args.rates, index_col=0, sep='\t')
+        trinucs = pd.read_csv(args.trinucs, index_col=0, sep='\t')
+        sub_matrix = get_transition_cpmatrix_from_rates(
+            rates, trinucs, generations=args.generations
+        )
+        sub_matrix.to_csv('files/best_in_df.csv', sep='\t')
+
+        #test for comparison
+        '''
+        from cuda_operations import get_transition_cpmatrix_from_rates_greedy
+        
+        rates = pd.read_csv(args.rates, index_col=0, sep='\t')
+        trinucs = pd.read_csv(args.trinucs, index_col=0, sep='\t')
+        sub_matrix = get_transition_cpmatrix_from_rates_greedy(
+            rates, trinucs, generations=args.generations
+        )
+        sub_matrix.to_csv('files/best_in_df_greedy.csv', sep='\t')
+        '''
+        
     run_name = 'cactus'
     episode = 'Anc4->hg38'
     population_size = 200000
@@ -64,10 +103,7 @@ if __name__ == '__main__':
     sig_genes=set(sig_genes) & set(valid_genes)
     
     #sig_genes = ['ENSG00000012048.26','ENSG00000141510.19'] #these genes not sig?
-    print(sig_genes)  
-    #maria not sure what this is doing
-    #sig_genes=sig_genes[:int((len(sig_genes)*1)/3)]
-    print(sig_genes)
+
     print(len(sig_genes) - len(analyzed_genes))
 
     occs_dfs = {gene: occs_dfs[gene] for gene in sig_genes if gene not in analyzed_genes}
@@ -78,6 +114,10 @@ if __name__ == '__main__':
     output_dir = f'Output/{run_name}'
     with open(f'{working_dir}/genes/genes.pkl', 'rb') as handle:
         gene_frames = pickle.load(handle)
+
+    #from parse genes_pkl.py to take codon and trinucs saved in cbase run
+    #then calculate number of non syn mutations per gene
+    #summarising into tallys of number of trinucs with each/alls alts as non syn
     site_summary, _ = summarize_genes(
         gene_frames,
         load_codon_table(Path(__file__).parent / 'Auxiliary' / 'codon_table.json'),
@@ -92,7 +132,10 @@ if __name__ == '__main__':
             'count': site['count'],
         })
     print('calculating mutation matrix from transition matrix')
-    calculate_general_muts_matrix(population_size)
+    #using 4 allele model+inputted N to infer mutation matrix
+    calculate_general_muts_matrix(
+        population_size, force=args.correct_rates_for_recurrence
+    )
 
     start = time.time()
     qv.compute_q_values(

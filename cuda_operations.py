@@ -8,6 +8,7 @@ import numpy as np
 from graphpoint import GraphPointAbstract as GPA
 from joblib import Parallel, delayed
 from database_interface import DatabaseInterface
+from scipy.optimize import least_squares
 
 try:
     best_seed = pd.read_csv('files/best_in_df_mutations.csv', index_col=0, header=0, sep='\t')
@@ -19,10 +20,13 @@ predictor = Predictor()
 database = DatabaseInterface()
 generations = 160000
 
-def get_error(initial_state, trasition_cpmatrix, observed_cpmatrix):
+def get_error(
+    initial_state, trasition_cpmatrix, observed_cpmatrix,
+    generations_count=generations,
+):
 
     arr_cupy = cupy.copy(trasition_cpmatrix)
-    result = cupy.linalg.matrix_power(arr_cupy, generations)
+    result = cupy.linalg.matrix_power(arr_cupy, generations_count)
     result = cupy.dot(result, initial_state)
     error_bases = cupy.subtract(result, observed_cpmatrix)
     error_bases = cupy.absolute(error_bases)
@@ -53,11 +57,17 @@ def approximate_sum(cpmat):
         approximated[row] = approximated[row] / approximated[row].sum()
     return approximated
 
-def get_try_cpmatrix(guessed_cpmat, max_error_pos, ratio):
+def get_try_cpmatrix(guessed_cpmat, max_error_pos, ratio, normalize_columns=False):
     try_cpmat = cupy.copy(guessed_cpmat)
     try_cpmat[max_error_pos] *= (ratio)
-    try_cpmat[max_error_pos[0]] = cupy.divide(try_cpmat[max_error_pos[0]], cupy.sum(try_cpmat[max_error_pos[0]]))
-    assert try_cpmat[2][15].get() == 0
+    if normalize_columns:
+        column = max_error_pos[1]
+        try_cpmat[:, column] = cupy.divide(
+            try_cpmat[:, column], cupy.sum(try_cpmat[:, column])
+        )
+    else:
+        row = max_error_pos[0]
+        try_cpmat[row] = cupy.divide(try_cpmat[row], cupy.sum(try_cpmat[row]))
     return try_cpmat
 
 def get_expected_from_IT(initial_state, trasition_matrix):
@@ -180,18 +190,34 @@ def check_get_number_of_mutations_matrix_orientation(occurences, trasition_matri
     mutations = result.get().sum().sum()
     return mutations
 
-def get_transition_cpmatrix(occurences, matrix):
+def get_transition_cpmatrix(
+    occurences,
+    matrix,
+    initial_state=None,
+    observed_matrix=None,
+    guessed_matrix=None,
+    normalize_columns=False,
+    max_loop=300000,
+    generations_count=generations,
+):
 
-    intial_state = cupy.array(es.matri64x4_to_64x64(occurences))
-    guessed_matrix = cupy.array(best_seed)
-    observed_matrix = cupy.array(es.get_observed_cpmatrix(matrix ,occurences))
+    if initial_state is None:
+        initial_state = es.matri64x4_to_64x64(occurences)
+    intial_state = cupy.array(initial_state)
+    if guessed_matrix is None:
+        guessed_matrix = best_seed
+    guessed_matrix = cupy.array(guessed_matrix)
+    if observed_matrix is None:
+        observed_matrix = es.get_observed_cpmatrix(matrix, occurences)
+    observed_matrix = cupy.array(observed_matrix)
     alpha = 0.99
-    max_loop = 300000
     error = cupy.array([0]*max_loop)
 
     for i in range(max_loop):
 
-        error_mat, errored_bases = get_error(intial_state, guessed_matrix, observed_matrix)
+        error_mat, errored_bases = get_error(
+            intial_state, guessed_matrix, observed_matrix, generations_count
+        )
         error[i] = errored_bases
 
         _max_errors, max_error_poss = max_errors_and_poss(error_mat)
@@ -202,9 +228,13 @@ def get_transition_cpmatrix(occurences, matrix):
             if observed_matrix[max_error_pos] == 0: continue
             analyzed = False
             for ratio in 1+alpha, 1-alpha:
-                try_matrix = get_try_cpmatrix(guessed_matrix, max_error_pos, ratio)
+                try_matrix = get_try_cpmatrix(
+                    guessed_matrix, max_error_pos, ratio, normalize_columns
+                )
                 #try_matrix = get_try_cpmatrix(intial_state, guessed_matrix, max_error_pos, ratio)
-                new_error_cpmat, _ = get_error(intial_state, try_matrix, observed_matrix)
+                new_error_cpmat, _ = get_error(
+                    intial_state, try_matrix, observed_matrix, generations_count
+                )
                 new_error_cpmat = cupy.absolute(new_error_cpmat)
 
                 if cupy.sum(new_error_cpmat) < cupy.sum(error_mat):
@@ -223,6 +253,136 @@ def get_transition_cpmatrix(occurences, matrix):
         if alpha < 1e-7:
             #print('converged')
             break
+
+    return guessed_matrix
+
+
+def get_transition_cpmatrix_from_rates(rates, occurences, generations=generations):
+    """Fit a per-generation 64x64 Q such that counts * Q**T matches rates.
+
+    The fit is performed as sixteen independent four-allele systems, one for
+    each pair of fixed trinucleotide flanks.  Rows are source contexts and
+    columns are destination contexts, matching ``best_in_df.csv``.
+    
+    solved using a weighted least-squares approach, where the weights are the square root of
+    the trinucleotide counts.  This is equivalent to assuming that the observed
+    counts are Poisson distributed, which is reasonable for rare mutation events.
+    """
+    contexts = es.CONTEXTS
+    rates = rates.loc[contexts, es.BASES].astype(float)
+    if isinstance(occurences, pd.DataFrame):
+        if occurences.shape[1] != 1:
+            raise ValueError('trinucleotide occurrences must have one count column')
+        occurences = occurences.iloc[:, 0]
+    occurences = occurences.loc[contexts].astype(float)
+    if generations <= 0:
+        raise ValueError('generations must be positive')
+    if not np.isfinite(rates.to_numpy()).all() or (rates < 0).any().any():
+        raise ValueError('rates must be finite and non-negative')
+    if not np.isfinite(occurences.to_numpy()).all() or (occurences <= 0).any():
+        raise ValueError('trinucleotide occurrences must be finite and positive')
+
+    def make_q(parameters):
+        #make matrix from rates and generations
+        q = np.zeros((4, 4), dtype=float)
+        parameter = iter(parameters)
+        for source in range(4):
+            for target in range(4):
+                if source != target:
+                    q[source, target] = next(parameter) / generations
+            q[source, source] = 1 - q[source].sum()
+        return q
+
+    output = pd.DataFrame(0.0, index=contexts, columns=contexts)
+    for left in es.BASES:
+        for right in es.BASES:
+            block_contexts = [left + base + right for base in es.BASES]
+            counts = occurences.loc[block_contexts].to_numpy()
+            observed = np.zeros((4, 4), dtype=float)
+            for source, context in enumerate(block_contexts):
+                for target, alt in enumerate(es.BASES):
+                    if source != target:
+                        observed[source, target] = rates.loc[context, alt]
+                observed[source, source] = 1 - observed[source].sum()
+            if (observed < 0).any():
+                raise ValueError(
+                    f'off-diagonal rates sum to more than one for {block_contexts}'
+                )
+
+            observed_mutations = counts[:, None] * observed
+            weights = np.sqrt(counts)[:, None]
+            initial = np.array([
+                observed[i, j]
+                for i in range(4)
+                for j in range(4)
+                if i != j
+            ])
+
+            def residual(parameters):
+                propagated = counts[:, None] * np.linalg.matrix_power(
+                    make_q(parameters), generations
+                )
+                return ((propagated - observed_mutations) / weights).ravel()
+
+            fit = least_squares(
+                residual, initial, bounds=(0.0, 50.0), x_scale='jac',
+                ftol=1e-12, xtol=1e-12, gtol=1e-12, max_nfev=4000,
+            )
+            if not fit.success:
+                raise RuntimeError(
+                    f'recurrence fit failed for {left}N{right}: {fit.message}'
+                )
+            output.loc[block_contexts, block_contexts] = make_q(fit.x)
+    return output
+
+
+def get_transition_cpmatrix_from_rates_greedy(
+    rates, occurences, generations=generations, max_loop=300000
+):
+    """Recurrence correction using the original 64x64 greedy fitter.
+
+    This is a comparison implementation for
+    :func:`get_transition_cpmatrix_from_rates`, which fits sixteen 4x4 blocks.
+    The original fitter uses target-by-source (column-stochastic) orientation,
+    so matrices are transposed at its boundary to retain the pipeline's
+    source-by-target output format.
+    """
+    contexts = es.CONTEXTS
+    rates = rates.loc[contexts, es.BASES].astype(float)
+    if isinstance(occurences, pd.DataFrame):
+        if occurences.shape[1] != 1:
+            raise ValueError('trinucleotide occurrences must have one count column')
+        occurences = occurences.iloc[:, 0]
+    occurences = occurences.loc[contexts].astype(float)
+
+    observed = pd.DataFrame(0.0, index=contexts, columns=contexts)
+    naive_q = pd.DataFrame(0.0, index=contexts, columns=contexts)
+    for context in contexts:
+        for alt in es.BASES:
+            if alt == context[1]:
+                continue
+            target = context[0] + alt + context[2]
+            observed.loc[context, target] = rates.loc[context, alt]
+            naive_q.loc[context, target] = rates.loc[context, alt] / generations
+        observed.loc[context, context] = 1 - observed.loc[context].sum()
+        naive_q.loc[context, context] = 1 - naive_q.loc[context].sum()
+
+    counts = occurences.to_numpy()
+    fitted_column_matrix = get_transition_cpmatrix(
+        occurences,
+        rates,
+        initial_state=np.diag(counts),
+        observed_matrix=(counts[:, None] * observed.to_numpy()).T,
+        guessed_matrix=naive_q.to_numpy().T,
+        normalize_columns=True,
+        max_loop=max_loop,
+        generations_count=generations,
+    )
+    if hasattr(fitted_column_matrix, 'get'):
+        fitted_column_matrix = fitted_column_matrix.get()
+    return pd.DataFrame(
+        np.asarray(fitted_column_matrix).T, index=contexts, columns=contexts
+    )
 
 def transition_matrix_scale(matrix_original, scale):
     #check if the matrix is the same as the general_mut_matrix
@@ -315,6 +475,7 @@ def get_mut_matrix_from_sub_matrix(sub_matrix, population_size, selection=0):
     '''
     function to input sub matrix and N and calculate the best fitting mut matrix
     using the four-allele mutation model for each trinucleotide flank context.
+    NOTE-Not doing recurrence correction in this step-ADD
     '''
     sub_index = sub_matrix.index; sub_columns = sub_matrix.columns
     sub_matrix = pd.DataFrame(

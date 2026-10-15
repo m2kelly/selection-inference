@@ -1,0 +1,9 @@
+Global matrix inference complete
+matrix_rmse: 4.36998527651e-08
+matrix_median_relative_error: 0.573916129539
+matrix_max_relative_error: 0.764786122419
+matrix_scale_ratio: 0.352015914477
+chr1:0: simulated=0.0010044165, inferred=0.0010045602
+chr1:1: simulated=0.014801634, inferred=0.014826095
+chr1:2: simulated=0.91725293, inferred=0.96035851
+chr1:3: simulated=0.027908547, inferred=0.027977573

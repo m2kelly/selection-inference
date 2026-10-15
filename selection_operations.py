@@ -228,47 +228,100 @@ class SelectionOperations:
         return matrix
 
     def _expected_four_allele_nonsyn(self, gene, scale, selection):
+        '''
+        Count sites ending in a nonsynonymous state after the generation interval.
+        Each reference/context/nonsynonymous-alternate class has its own 4x4
+        transition matrix because its fitness assignments depend on that class.
+        '''
         if self.population_size is None:
             raise ValueError('population_size is required for four-allele inference')
 
         point = GPA(0, 0, self.population_size)
         matrix_cache = {}
-        rate_cache = {}
-        expected = 0.0
+        transition_cache = {}
+        endpoint_cache = {}
+        grouped_sites = {}
         for site in gene.nonsyn_sites:
             trinucleotide = site['trinucleotide']
             ref = site['reference_base']
             nonsyn_alts = tuple(site['nonsyn_alt_bases'])
             left, right = trinucleotide[0], trinucleotide[2]
             context_key = (left, right)
+            site_key = (context_key, ref, nonsyn_alts)
+            grouped_sites[site_key] = (
+                grouped_sites.get(site_key, 0.0) + float(site['count'])
+            )
+
+        expected = cupy.asarray(0.0, dtype=cupy.float64)
+        for (context_key, ref, nonsyn_alts), count in grouped_sites.items():
             if context_key not in matrix_cache:
+                left, right = context_key
                 matrix_cache[context_key] = self._get_four_allele_mutation_matrix(
                     left, right, scale
                 )
+            left, right = context_key
+            trinucleotide = left + ref + right
 
-            rate_key = (context_key, ref, nonsyn_alts, selection)
-            if rate_key not in rate_cache:
+            # With neutrality, all nonsynonymous classes sharing a flank context
+            # have the same rate and transition matrices, irrespective of which
+            # alternate alleles are counted as nonsynonymous.
+            if selection == 0:
+                transition_key = context_key
+                endpoint_key = (context_key, ref)
+            else:
+                transition_key = (context_key, ref, nonsyn_alts, selection)
+                endpoint_key = transition_key
+
+            if transition_key not in transition_cache:
                 fitness = {base: 1.0 for base in BASES}
                 for alt in nonsyn_alts:
                     fitness[alt] = 1.0 + selection
-                rate_cache[rate_key] = sum(
-                    self.predictor.get_sub_rate_diffusion_4_allele_renewal_selection(
-                        point,
-                        matrix_cache[context_key],
-                        fitness_matrix=fitness,
-                        all_rates=False,
-                        a=ref,
-                        b=alt,
-                    )
-                    for alt in nonsyn_alts
+                rates = self.predictor.get_sub_rate_diffusion_4_allele_renewal_selection(
+                    point,
+                    matrix_cache[context_key],
+                    fitness_matrix=fitness,
                 )
 
-            expected += (
-                float(site['count'])
-                * rate_cache[rate_key]
-                * self.generations
-            )
-        return expected
+                rate_matrix = np.array(
+                    [
+                        [rates[source][target] for target in BASES]
+                        for source in BASES
+                    ],
+                    dtype=float,
+                )
+                if not np.isfinite(rate_matrix).all() or (rate_matrix < 0).any():
+                    raise ValueError(
+                        f'Invalid substitution rates for {trinucleotide}, '
+                        f'{ref}, nonsynonymous alts {nonsyn_alts}'
+                    )
+
+                transition_matrix = rate_matrix.copy()
+                np.fill_diagonal(transition_matrix, 0.0)
+                for source_index, source in enumerate(BASES):
+                    outgoing_rate = transition_matrix[source_index].sum()
+                    if outgoing_rate > 1.0:
+                        raise ValueError(
+                            f'Outgoing substitution rate exceeds one per generation '
+                            f'for {trinucleotide} {source}: {outgoing_rate}'
+                        )
+                    transition_matrix[source_index, source_index] = 1.0 - outgoing_rate
+
+                P = cupy.asarray(transition_matrix, dtype=cupy.float64)
+                transition_cache[transition_key] = cupy.linalg.matrix_power(
+                    P, self.generations
+                )
+
+            if endpoint_key not in endpoint_cache:
+                initial_counts = cupy.zeros(len(BASES), dtype=cupy.float64)
+                initial_counts[BASES.index(ref)] = 1.0
+                endpoint_cache[endpoint_key] = cupy.dot(
+                    initial_counts, transition_cache[transition_key]
+                )
+
+            endpoint_probabilities = endpoint_cache[endpoint_key]
+            nonsyn_indices = [BASES.index(alt) for alt in nonsyn_alts]
+            expected += count * cupy.sum(endpoint_probabilities[nonsyn_indices])
+        return float(expected.get())
 
     def get_selection_four_allele(self, gene, nexp):
         if not gene.nonsyn_sites:
@@ -284,15 +337,20 @@ class SelectionOperations:
             )
 
         def neutral_error(log_scale):
-            expected = self._expected_four_allele_nonsyn(
-                gene, 10 ** log_scale, 0.0
-            )
+            #no selection, rescale to match nexp calculated from cbase 
+            try:
+                expected = self._expected_four_allele_nonsyn(
+                    gene, 10 ** log_scale, 0.0
+                )
+            except ValueError:
+                return np.inf
             return abs(expected - nexp)
 
         scale_solution = minimize_scalar(
             neutral_error,
             bounds=(np.log10(0.1), np.log10(5.0)),
             method='bounded',
+            options={'xatol': 1e-10},
         )
         if not scale_solution.success or not np.isfinite(scale_solution.fun):
             raise RuntimeError(
@@ -304,9 +362,12 @@ class SelectionOperations:
             lower, upper = -upper, -lower
 
         def selection_error(selection):
-            expected = self._expected_four_allele_nonsyn(
-                gene, scale, selection
-            )
+            try:
+                expected = self._expected_four_allele_nonsyn(
+                    gene, scale, selection
+                )
+            except ValueError:
+                return np.inf
             print(f'{gene.gene_name}: selection = {selection}, expected = {expected}, obs = {gene.nobs}')
             return abs(expected - gene.nobs)
 
@@ -314,6 +375,7 @@ class SelectionOperations:
             selection_error,
             bounds=(lower, upper),
             method='bounded',
+            options={'xatol': max((upper - lower) * 1e-8, 1e-14)},
         )
         if not selection_solution.success or not np.isfinite(selection_solution.fun):
             raise RuntimeError(

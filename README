@@ -1,5 +1,26 @@
+4 allele changes
+
+pipeline is theoretically working and outputtin an s
+but very small s
+think likely a problem in implementatoin
+such a small s able to explain difference, as causes tiny difference per sites summed over whole gene length 
+
+Note in predictor.py get mu changed the get mu to use get sub selection, when want to use netral 
+get sub whenever possible
+-revert back to same predictor.py as in 4 alelle case?
+
+
+Notaccounting for recurrence in current implementatio-Q*T 
+rather than Q**T
+
 run correct_dndn.py
 in files place rates df, then convert to muts df
+
+Optional recurrence-aware rate conversion (keeps the old converter unchanged):
+python correct_dndn.py --correct-rates-for-recurrence
+This fits files/best_in_df.csv so trinucleotide counts propagated through
+Q**160000 reproduce files/trinucs * files/rates, then refreshes the cached
+four-allele mutation matrix before continuing the pipeline.
 
 output is given in analysed genes:
 [gene.gene_name, str(gene.expected_selection), str(gene.max_possible_highest_selection), str(gene.min_possible_highest_selection),

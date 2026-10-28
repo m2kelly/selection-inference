@@ -137,7 +137,7 @@ def main():
     metadata = pd.read_csv(
         args.simulation_dir / 'bin_metadata.tsv', sep='\t'
     ).set_index(['chr', 'bin'])
-    metadata=metadata.iloc[:5]
+    metadata=metadata.iloc[:100]
     truth = load_simulated_mutation_matrix(
         args.simulation_dir, args.truth_matrix
     )

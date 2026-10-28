@@ -7,7 +7,8 @@ import essentials as es
 import cuda_operations as co
 import numpy as np
 from joblib import Parallel, delayed
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize_scalar, brentq
+
 
 from predictor import Predictor
 from graphpoint import GraphPointAbstract as GPA
@@ -17,7 +18,9 @@ CONTEXTS = [f'{b1}{b2}{b3}' for b1 in BASES for b2 in BASES for b3 in BASES]
 wfes_single = '/home/hossam26644/Documents/wfes/wfes2/bin/wfes_single'
 
 class SelectionOperations:
-    def __init__(self, selection_range=[0.0000001,0.0001], generations=160000,
+    #nonsyn max 0.0001
+    #nonsense max 0.01
+    def __init__(self, selection_range=[0.0000001,0.001], generations=160000,
                  population_size=None, transition_matrix='files/transition_matrix.csv',
                  syn_occs='files/occurences.csv'):
         self.selection_range = selection_range
@@ -96,6 +99,8 @@ class SelectionOperations:
         of the mutation to the expected number of synonymous mutations
         returns sum of n*p, for n->~inf
         '''
+        if ratio == 0:
+            return 0.0
         if pofx_given_s is None: pofx_given_s = gene.pofx_given_s
 
         sumpvals = 0
@@ -132,11 +137,96 @@ class SelectionOperations:
             n += 1.0
         return lowest_val, highest_val
 
+
+    def get_selection_no_parallel(self,gene,nexp):
+        '''
+        alternative idea to avoid implementing the 4 allele maths with selection
+        to apply to genes with strong selection so no recurrence or parallele mutations
+        do not need to apply the 4 alelle maths correction or Q^T correction
+        '''
+        if not gene.nonsyn_sites:
+            if gene.nobs == 0:
+                return 0.0
+            raise ValueError(
+                f'No possible nonsynonymous sites were parsed for {gene.gene_name}'
+            )
+        if nexp <= 0:
+            raise ValueError(
+                f'Cannot calibrate a positive mutation rate from expected_n={nexp} '
+                f'for {gene.gene_name}'
+            )
+
+        def neutral_error(log_scale):
+            #no selection, rescale to match nexp calculated from cbase
+            try:
+                expected = self._expected_four_allele_nonsyn(
+                    gene, 10 ** log_scale, 0.0
+                )
+            except ValueError:
+                return np.inf
+            return abs(expected - nexp)
+
+        scale_solution = minimize_scalar(
+            neutral_error,
+            bounds=(np.log10(0.1), np.log10(5.0)),
+            method='bounded',
+            options={'xatol': 1e-10},
+        )
+        if not scale_solution.success or not np.isfinite(scale_solution.fun):
+            raise RuntimeError(
+                f'Could not rescale the four-allele mutation rates for {gene.gene_name}'
+            )
+        scale = 10 ** scale_solution.x
+        Ne = self.population_size
+        if Ne is None or Ne <= 0:
+            raise ValueError('population_size must be positive')
+
+        
+        #expected mutations rather than expected subs-just rescale with mu and do not do recurrence correction? 
+        exp_muts = self._expected_four_allele_mutation_nonsyn(gene, scale,recurrence=True)
+        if exp_muts <= 0:
+            raise ValueError(
+                f'Expected nonsynonymous mutations must be positive for '
+                f'{gene.gene_name}: {exp_muts}'
+            )
+        w = gene.nobs / exp_muts
+        if np.isclose(w, 1.0):
+            return 0.0
+
+        #compare to wright fisher diffusion approximations to sub rate with selection/sub rate without selection
+        #2N(1-e**(-2s))/1-e**(-2Ns)
+        from scipy.optimize import brentq
+
+        def fixation_ratio(s):
+            if s == 0:
+                return 1.0 / Ne
+
+            return 2*Ne*(np.expm1(-2*s)) / np.expm1(-2*Ne*s)
+
+        def error(s):
+            return fixation_ratio(s) - w
+
+        lower, upper = self.selection_range
+
+        if w < 1:
+            lower, upper = -upper, -lower
+
+        selection = brentq(error, lower, upper)
+
+        return float(selection)
+
+        
+
+
     def get_selection(self, gene, nexp):
 
         if gene.nobs == nexp: return 0
         if gene.nonsyn_sites is not None:
+            #testing no parallel, no recurrence correction method 
+            #return self.get_selection_no_parallel(gene,nexp)
             return self.get_selection_four_allele(gene, nexp)
+        else:
+            raise ValueError('did not supply trinucs for 4 allele model ')
 
         #neutral run, s=0 to rescale mut matrix
         #minimises x  |sub=f(x*mu, N, s=0)-nexp| 
@@ -213,6 +303,7 @@ class SelectionOperations:
                 index_col=0,
                 sep='\t',
             )
+        
 
         matrix = {base: {alt: 0.0 for alt in BASES} for base in BASES}
         for ref in BASES:
@@ -226,6 +317,117 @@ class SelectionOperations:
                     * scale
                 )
         return matrix
+    
+
+    def _expected_four_allele_mutation_nonsyn(self, gene, scale,recurrence=False):
+        '''
+        Count sites ending in a nonsynonymous state after the generation interval.
+        #rescale non digagonal entries with scale, recalculate dignaonal =1-sum 9row)
+        #multply be nonsyn trinuc->alt counts *generations
+        #sum to get expected number of muts
+        '''
+        if not hasattr(self, 'general_mut_matrix'):
+            self.general_mut_matrix = pd.read_csv(
+                'files/best_in_df_mutations_4_allele.csv',
+                index_col=0,
+                sep='\t',
+            )
+        expected = 0.0
+        if not recurrence:
+            for site in gene.nonsyn_sites:
+                trinucleotide = site['trinucleotide']
+                count = float(site['count'])
+                for alt in site['nonsyn_alt_bases']:
+                    target = trinucleotide[0] + alt + trinucleotide[2]
+                    expected += (
+                        count
+                        * float(self.general_mut_matrix.loc[trinucleotide, target])
+                        * scale
+                        * self.generations
+                    )
+            return expected
+        
+        matrix_cache = {}
+        transition_cache = {}
+        endpoint_cache = {}
+        grouped_sites = {}
+        for site in gene.nonsyn_sites:
+            trinucleotide = site['trinucleotide']
+            ref = site['reference_base']
+            nonsyn_alts = tuple(site['nonsyn_alt_bases'])
+            left, right = trinucleotide[0], trinucleotide[2]
+            context_key = (left, right)
+            site_key = (context_key, ref, nonsyn_alts)
+            grouped_sites[site_key] = (
+                grouped_sites.get(site_key, 0.0) + float(site['count'])
+            )
+
+        #calculate sub rates on trinuc groups =per group
+        expected = cupy.asarray(0.0, dtype=cupy.float64)
+        for (context_key, ref, nonsyn_alts), count in grouped_sites.items():
+            if context_key not in matrix_cache:
+                left, right = context_key
+                matrix_cache[context_key] = self._get_four_allele_mutation_matrix(
+                    left, right, scale
+                )
+            left, right = context_key
+            trinucleotide = left + ref + right
+
+            # With neutrality, all nonsynonymous classes sharing a flank context
+            # have the same rate and transition matrices, irrespective of which
+            # alternate alleles are counted as nonsynonymous.
+            
+            transition_key = (context_key, ref, nonsyn_alts)
+            endpoint_key = transition_key
+
+            if transition_key not in transition_cache:
+                
+                rates = matrix_cache[context_key]
+
+                rate_matrix = np.array(
+                    [
+                        [rates[source][target] for target in BASES]
+                        for source in BASES
+                    ],
+                    dtype=float,
+                )
+                if not np.isfinite(rate_matrix).all() or (rate_matrix < 0).any():
+                    raise ValueError(
+                        f'Invalid substitution rates for {trinucleotide}, '
+                        f'{ref}, nonsynonymous alts {nonsyn_alts}'
+                    )
+
+                #4x4 transition matrix under config
+                transition_matrix = rate_matrix.copy()
+                np.fill_diagonal(transition_matrix, 0.0)
+                for source_index, source in enumerate(BASES):
+                    outgoing_rate = transition_matrix[source_index].sum()
+                    if outgoing_rate > 1.0:
+                        raise ValueError(
+                            f'Outgoing substitution rate exceeds one per generation '
+                            f'for {trinucleotide} {source}: {outgoing_rate}'
+                        )
+                    transition_matrix[source_index, source_index] = 1.0 - outgoing_rate
+
+                P = cupy.asarray(transition_matrix, dtype=cupy.float64)
+                transition_cache[transition_key] = cupy.linalg.matrix_power(
+                    P, self.generations
+                )
+
+            if endpoint_key not in endpoint_cache:
+                initial_counts = cupy.zeros(len(BASES), dtype=cupy.float64)
+                initial_counts[BASES.index(ref)] = 1.0
+                endpoint_cache[endpoint_key] = cupy.dot(
+                    initial_counts, transition_cache[transition_key]
+                )
+            #only add porbability of the nonsyn subs to happen
+            endpoint_probabilities = endpoint_cache[endpoint_key]
+            nonsyn_indices = [BASES.index(alt) for alt in nonsyn_alts]
+            expected += count * cupy.sum(endpoint_probabilities[nonsyn_indices])
+        return float(expected.get())
+
+
+
 
     def _expected_four_allele_nonsyn(self, gene, scale, selection):
         '''
@@ -252,6 +454,7 @@ class SelectionOperations:
                 grouped_sites.get(site_key, 0.0) + float(site['count'])
             )
 
+        #calculate sub rates on trinuc groups =per group
         expected = cupy.asarray(0.0, dtype=cupy.float64)
         for (context_key, ref, nonsyn_alts), count in grouped_sites.items():
             if context_key not in matrix_cache:
@@ -290,11 +493,14 @@ class SelectionOperations:
                     dtype=float,
                 )
                 if not np.isfinite(rate_matrix).all() or (rate_matrix < 0).any():
-                    raise ValueError(
+                    
+                    print(
                         f'Invalid substitution rates for {trinucleotide}, '
                         f'{ref}, nonsynonymous alts {nonsyn_alts}'
                     )
+                    return np.inf
 
+                #4x4 transition matrix under config
                 transition_matrix = rate_matrix.copy()
                 np.fill_diagonal(transition_matrix, 0.0)
                 for source_index, source in enumerate(BASES):
@@ -317,7 +523,7 @@ class SelectionOperations:
                 endpoint_cache[endpoint_key] = cupy.dot(
                     initial_counts, transition_cache[transition_key]
                 )
-
+            #only add porbability of the nonsyn subs to happen
             endpoint_probabilities = endpoint_cache[endpoint_key]
             nonsyn_indices = [BASES.index(alt) for alt in nonsyn_alts]
             expected += count * cupy.sum(endpoint_probabilities[nonsyn_indices])
@@ -325,16 +531,20 @@ class SelectionOperations:
 
     def get_selection_four_allele(self, gene, nexp):
         if not gene.nonsyn_sites:
-            if gene.nobs == 0:
-                return 0.0
+            
             raise ValueError(
+               
                 f'No possible nonsynonymous sites were parsed for {gene.gene_name}'
             )
-        if nexp <= 0:
+        #if gene.nobs == 0:
+            #return 0.0
+        if nexp <= 0 or np.isnan(nexp):
             raise ValueError(
                 f'Cannot calibrate a positive mutation rate from expected_n={nexp} '
                 f'for {gene.gene_name}'
             )
+        
+        print(gene.nobs,nexp)
 
         def neutral_error(log_scale):
             #no selection, rescale to match nexp calculated from cbase 
@@ -357,6 +567,62 @@ class SelectionOperations:
                 f'Could not rescale the four-allele mutation rates for {gene.gene_name}'
             )
         scale = 10 ** scale_solution.x
+
+        print(f'{gene.gene_name} scale={scale}')
+        
+        lower, upper = self.selection_range
+        if gene.nobs < nexp:
+            lower, upper = -upper, -lower
+
+        tolerance=max((upper - lower) * 1e-5, 1e-8)
+        #tolerance=max((upper - lower) * 1e-8, 1e-14)
+
+        if gene.nobs == 0:
+
+            if tolerance <= 0:
+                raise ValueError("Tolerance must be positive")
+
+            def expected_n(s):
+                try:
+                    exp=self._expected_four_allele_nonsyn(gene, scale, s)
+                    print(s,exp)
+                    return exp
+                except (ValueError, OverflowError):
+                    return np.inf
+
+            # Check neutrality first
+            if expected_n(0.0) <= tolerance:
+                return 0.0
+
+            # Find a finite expected value below tolerance
+            # Search from strongest negative selection towards zero
+            s_values = np.logspace(lower, 0.0, 100)
+
+            strongest_valid_s = None
+
+            for s in s_values:
+                exp = expected_n(s)
+
+                if np.isfinite(exp) and exp <= tolerance:
+                    strongest_valid_s = s
+                    break
+
+            if strongest_valid_s is None:
+                raise ValueError(
+                    f'Cannot reach tolerance={tolerance} for {gene.gene_name}'
+                )
+
+            # Find weakest negative selection satisfying tolerance
+            solution = brentq(
+                lambda s: expected_n(s) - tolerance,
+                strongest_valid_s,
+                0.0,
+                xtol=1e-10,
+            )
+
+            return float(solution)
+
+        #minimize error between n obs and E[n|s]
         lower, upper = self.selection_range
         if gene.nobs < nexp:
             lower, upper = -upper, -lower
@@ -375,7 +641,7 @@ class SelectionOperations:
             selection_error,
             bounds=(lower, upper),
             method='bounded',
-            options={'xatol': max((upper - lower) * 1e-8, 1e-14)},
+            options={'xatol': tolerance},
         )
         if not selection_solution.success or not np.isfinite(selection_solution.fun):
             raise RuntimeError(

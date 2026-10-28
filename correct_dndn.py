@@ -16,15 +16,15 @@ import essentials as es
 from graphpoint import GraphPointAbstract as GPA
 from parse_genes_pkl import load_codon_table, summarize_genes
 
-def get_sig_genes(qvals_file):
+def get_sig_genes(qvals_file, nonsense_only=False):
     qvals_df = pd.read_csv(qvals_file, sep='\t', index_col=0, skiprows=1)
     qvals_df_sig = qvals_df[qvals_df['q_phi_neg'] < 0.05]
-    qvals_df_sig = qvals_df_sig[qvals_df_sig['m_obs'] >= 1]
-    #sort by dn/ds ascending
-    #qvals_df_sig = qvals_df_sig.sort_values(by='d(m+k)/ds', ascending=True)
-    
-    #sample 100 genes randomly
-    #qvals_df_sig = qvals_df_sig.sample(100)
+    observed_column = 'k_obs' if nonsense_only else 'm_obs'
+
+    #testing when n=0
+    qvals_df_sig = qvals_df_sig[qvals_df_sig[observed_column] == 0]
+    #qvals_df_sig = qvals_df_sig[qvals_df_sig[observed_column] >= 1]
+        
     return qvals_df_sig.index.tolist()
 
 
@@ -54,6 +54,10 @@ def parse_args():
     parser.add_argument('--rates', default='files/rates')
     parser.add_argument('--trinucs', default='files/trinucs')
     parser.add_argument('--generations', type=int, default=160000)
+    parser.add_argument(
+        '--nonsense-only', action='store_true',
+        help='run selection using only nonsense mutations and targets',
+    )
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -86,7 +90,7 @@ if __name__ == '__main__':
     population_size = 200000
 
     qvals_file = f'Output/{run_name}/{episode}/q_values_{run_name}.txt'
-    sig_genes = get_sig_genes(qvals_file)
+    sig_genes = get_sig_genes(qvals_file, nonsense_only=args.nonsense_only)
     try: analyzed_genes = pd.read_csv('analyzed_genes.csv', sep='\t', index_col=0).index
     except FileNotFoundError: analyzed_genes = []
      #TP53,BRCA1
@@ -100,11 +104,11 @@ if __name__ == '__main__':
     valid_genes=set(occs_dfs.keys()) & set(syn_target_dfs.keys())
     
     sig_genes = [s for s in sig_genes if s in occs_dfs]
-    sig_genes=set(sig_genes) & set(valid_genes)
+    sig_genes=set(sig_genes) & set(valid_genes) - set(analyzed_genes)
     
     #sig_genes = ['ENSG00000012048.26','ENSG00000141510.19'] #these genes not sig?
 
-    print(len(sig_genes) - len(analyzed_genes))
+    print(f'number of significant genes to compute: {len(sig_genes)}')
 
     occs_dfs = {gene: occs_dfs[gene] for gene in sig_genes if gene not in analyzed_genes}
     syn_target_dfs = {gene: syn_target_dfs[gene] for gene in sig_genes if gene not in analyzed_genes}
@@ -122,6 +126,7 @@ if __name__ == '__main__':
         gene_frames,
         load_codon_table(Path(__file__).parent / 'Auxiliary' / 'codon_table.json'),
         genes=sig_genes,
+        nonsense_only=args.nonsense_only,
     )
     nonsyn_sites_by_gene = {gene: [] for gene in sig_genes}
     for site in site_summary.to_dict(orient='records'):
@@ -146,5 +151,6 @@ if __name__ == '__main__':
         syn_target_dfs,
         population_size,
         nonsyn_sites_by_gene,
+        nonsense_only=args.nonsense_only,
     )
     print(f'elabsed time = {time.time() - start}')

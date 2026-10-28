@@ -60,9 +60,54 @@ def export_analyzed_genes(analyzed_genes, output_file='analyzed_genes.csv'):
 
     print(f'Data has been successfully exported to {output_file}')
 
+def compute_nonsense_selection(
+    genes, population_size, nonsense_sites_by_gene=None,
+    occs_df_dict=None, pofx_given_s=None, so=None,
+):
+    '''
+    Calculate per-gene selection as for all nonsynonymous mutations, but
+    using only nonsense observations, expectations, and sites.
+
+    This generally measures stronger selection pressure with less power.
+    '''
+    
+    
+    if so is None:
+        so = SelectionOperations(population_size=population_size)
+
+    def analyze_gene(gene):
+        gene_name = gene["gene"]
+        # Reuse the nonsynonymous analysis with the missense channel disabled.
+        nonsense_gene = gene.copy()
+        nonsense_gene["obs"] = [0, gene["obs"][1], gene["obs"][2]]
+        nonsense_gene["exp"] = [0, gene["exp"][1], gene["exp"][2]]
+        gene = Gene(
+            nonsense_gene,
+            large_flag=0,
+            occs=occs_df_dict[gene_name],
+            syn_target=None,
+            pofx_given_s=pofx_given_s,
+            nonsyn_sites=nonsense_sites_by_gene.get(gene_name),
+        )
+        try:
+            return so.run_analysis(gene)
+        except Exception as error:
+            sys.stderr.write(f"Skipping gene {gene_name}: {error}\n")
+            return None
+
+    if occs_df_dict is None or pofx_given_s is None:
+        raise ValueError("occs_df_dict and pofx_given_s are required")
+    if nonsense_sites_by_gene is None:
+        raise ValueError("nonsense_sites_by_gene is required")
+    
+    return [result for result in Parallel(n_jobs=2, verbose=0)(
+        delayed(analyze_gene)(gene) for gene in genes
+    ) if result is not None]
+
+
 def compute_p_values(
     p, genes, aux, occs_df_dict, syn_target_df_dict, so=None,
-    nonsyn_sites_by_gene=None,
+    nonsyn_sites_by_gene=None, nonsense_only=False,
 ):
     
     
@@ -132,6 +177,17 @@ def compute_p_values(
                 return ( np.exp( np.log(w) + x*np.log(r) + (s + x)*np.log(L*b) + (-s - x - a)*np.log(1 + L*(1 + r)*b) + sp.gammaln(s + x + a) - sp.gammaln(s+1) - sp.gammaln(x+1) - sp.gammaln(a) ) + mp.exp( np.log(1-w) + np.log(2) + (s + x)*np.log(L) + x*np.log(r) + (0.5 * (-s - x + g))*np.log((L*(1 + r))/d) + g*np.log(d) + mp.log(mp.besselk(s + x - g, 2*np.sqrt(L*(1 + r)*d))) - sp.gammaln(s+1) - sp.gammaln(x+1) - sp.gammaln(g) ) ) / pofs(s, L, thr)
             else:
                 return ( np.exp( np.log(w) + x*np.log(r) + (s + x)*np.log(L*b) + (-s - x - a)*np.log(1 + L*(1 + r)*b) + sp.gammaln(s + x + a) - sp.gammaln(s+1) - sp.gammaln(x+1) - sp.gammaln(a) ) + np.exp( np.log(1-w) + np.log(2) + (s + x)*np.log(L) + x*np.log(r) + (0.5 * (-s - x + g))*np.log((L*(1 + r))/d) + g*np.log(d) + np.log(sp.kv(s + x - g, 2*np.sqrt(L*(1 + r)*d))) - sp.gammaln(s+1) - sp.gammaln(x+1) - sp.gammaln(g) ) ) / pofs(s, L, thr)
+
+    if nonsense_only:
+        analyzed_genes = compute_nonsense_selection(
+            genes,
+            population_size=so.population_size if so is not None else None,
+            nonsense_sites_by_gene=nonsyn_sites_by_gene,
+            occs_df_dict=occs_df_dict,
+            pofx_given_s=pofx_given_s,
+            so=so,
+        )
+        return [], [], analyzed_genes
 
     anaylzed_genes = []
     pvals=[]
@@ -311,7 +367,13 @@ def compute_p_values(
                     ),
                 )
                 if so:
-                    analyzed_gene = so.run_analysis(gene)
+                    try:
+                        analyzed_gene = so.run_analysis(gene)
+                    except Exception as error:
+                        sys.stderr.write(
+                            f"Skipping gene: {error}\n"
+                        )
+                        return None
                 #genes_dn_by_dn.append(get_dn_by_dn(gene["gene"], mobs, kobs, pofx_given_s, sobs, L, ratm, ratk, large_flag,
                 #                      genes_df_dict[gene["gene"]], occs_df_dict[gene["gene"]], syn_ratio)+
                 #                      '\t'+str(gene['len']))
@@ -320,9 +382,9 @@ def compute_p_values(
             return analyzed_gene
             #pvals.append([analyzed_gene.gene_name, m_pneg, k_pneg, m_ppos, k_ppos, pofx_given_s(0, sobs, L, ratm, 0), pofx_given_s(0, sobs, L, ratk, 0), mobs, kobs, sobs])
 
-    analyzed_genes = Parallel(n_jobs=1, verbose=0)(delayed(analyze_gene)(gene) for gene in genes)
-    exit()
-    export_analyzed_genes(analyzed_genes)
+    analyzed_genes = Parallel(n_jobs=2, verbose=0)(delayed(analyze_gene)(gene) for gene in genes)
+    
+    #export_analyzed_genes(analyzed_genes)
 
     #sys.stderr.write("100% done.\n")
 
@@ -451,8 +513,9 @@ run_no		= 50					#	No. of simulation replicates used for computing FDR
 #	Collect parameter estimates from all fitted models in working directory.
 def compute_q_values(
     directory, outname, output_dir, occs_dfs, syn_target_dfs,
-    population_size=None, nonsyn_sites_by_gene=None,
+    population_size=None, nonsyn_sites_by_gene=None, nonsense_only=False,
 ):
+    so = None
     if population_size: so = SelectionOperations(population_size=population_size)
 
     #shitty way to get the matrix
@@ -512,8 +575,10 @@ def compute_q_values(
         field = line.strip().split("\t")
         if field[0] not in occs_dfs: continue
         if field[0] not in syn_target_dfs: continue
-        #mks_type.append({"gene": field[0], "exp": [float(field[1]), float(field[2]), float(field[3])], "obs": [float(field[4]), float(field[5]), float(field[6])], "len": int(field[7])})
-        mks_type.append({"gene": field[0], "exp": [float(field[1])+float(field[2]), 0, float(field[3])], "obs": [float(field[4])+float(field[5]),0, float(field[6])], "len": int(field[7])})
+        if nonsense_only:
+            mks_type.append({"gene": field[0], "exp": [0, float(field[2]), float(field[3])], "obs": [0, float(field[5]), float(field[6])], "len": int(field[7])})
+        else:
+            mks_type.append({"gene": field[0], "exp": [float(field[1])+float(field[2]), 0, float(field[3])], "obs": [float(field[4])+float(field[5]),0, float(field[6])], "len": int(field[7])})
     mks_type = sorted(mks_type, key=lambda arg: arg["gene"])
     #mks_type = sorted(mks_type, key=lambda arg: arg["obs"][0]/arg["exp"][0])
 
@@ -526,6 +591,7 @@ def compute_q_values(
         syn_target_dfs,
         so,
         nonsyn_sites_by_gene,
+        nonsense_only,
     )
 
     export_analyzed_genes(analyzed_genes)

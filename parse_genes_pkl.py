@@ -121,11 +121,14 @@ def summarize_genes(
     codon_table: Mapping[str, str],
     site_output: Path | None = None,
     genes: set[str] | None = None,
+    nonsense_only: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Summarize sites having at least one nonsynonymous alternate allele.
+    """Summarize sites having at least one selected alternate allele.
 
     The optional detailed TSV is streamed so the full human pickle does not
-    require retaining tens of millions of site rows in memory.
+    require retaining tens of millions of site rows in memory. By default all
+    nonsynonymous alleles are selected; ``nonsense_only`` restricts the target
+    alleles to nonsense mutations.
     """
     counts: Counter[tuple[object, ...]] = Counter()
     stats = Counter(frames=0, input_rows=0, valid_codons=0, skipped_rows=0)
@@ -171,15 +174,22 @@ def summarize_genes(
 
                 codon = pentamer[1:4]
                 for site in classifications[pentamer]:
-                    if site["n_nonsyn"] == 0:
+                    if nonsense_only:
+                        target_alts = tuple(
+                            base for base, kind in site["mutation_types"].items()
+                            if kind == "nonsense"
+                        )
+                    else:
+                        target_alts = site["nonsyn_alt_bases"]
+                    if not target_alts:
                         stats["all_syn_sites_omitted"] += 1
                         continue
 
-                    nonsyn = "".join(site["nonsyn_alt_bases"])
+                    nonsyn = "".join(target_alts)
                     syn = "".join(site["syn_alt_bases"])
                     key = (
                         gene, site["trinucleotide"], site["reference_base"],
-                        site["n_nonsyn"], nonsyn, syn,
+                        len(target_alts), nonsyn, syn,
                     )
                     counts[key] += 1
                     stats["recorded_sites"] += 1
@@ -220,7 +230,7 @@ def write_summary(summary: pd.DataFrame, path: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--genes_pickle", type=Path,
-                        default=Path("Output/cactus/Anc4->hg38/genes/genes.pkl"), help="CBaSE-is genes.pkl")
+                        default=Path("Output/cactus/hg38_Anc4/Anc4->hg38/genes/genes.pkl"), help="CBaSE-is genes.pkl")
     
     parser.add_argument(
         "--codon-table", type=Path,
@@ -239,6 +249,10 @@ def parse_args() -> argparse.Namespace:
         "--gene", action="append", dest="genes",
         help="only process this gene; may be supplied more than once",
     )
+    parser.add_argument(
+        "--nonsense-only", action="store_true",
+        help="summarize only nonsense rather than all nonsynonymous targets",
+    )
     return parser.parse_args()
 
 
@@ -252,6 +266,7 @@ def main() -> None:
         codon_table,
         site_output=args.sites,
         genes=set(args.genes) if args.genes else None,
+        nonsense_only=args.nonsense_only,
     )
     write_summary(summary, args.summary)
     print(json.dumps({**stats, "summary_rows": len(summary)}, sort_keys=True))
